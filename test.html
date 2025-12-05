@@ -1,0 +1,328 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Claude Proxy 测试</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding: 20px;
+        }
+
+        .container {
+            background: white;
+            border-radius: 12px;
+            box-shadow: 0 10px 40px rgba(0, 0, 0, 0.2);
+            padding: 40px;
+            max-width: 800px;
+            width: 100%;
+        }
+
+        h1 {
+            color: #333;
+            margin-bottom: 10px;
+            font-size: 28px;
+        }
+
+        .subtitle {
+            color: #666;
+            margin-bottom: 30px;
+            font-size: 14px;
+        }
+
+        .form-group {
+            margin-bottom: 20px;
+        }
+
+        label {
+            display: block;
+            margin-bottom: 8px;
+            color: #555;
+            font-weight: 500;
+            font-size: 14px;
+        }
+
+        input, textarea {
+            width: 100%;
+            padding: 12px;
+            border: 2px solid #e1e8ed;
+            border-radius: 8px;
+            font-size: 14px;
+            transition: border-color 0.3s;
+            font-family: inherit;
+        }
+
+        input:focus, textarea:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+
+        textarea {
+            resize: vertical;
+            min-height: 100px;
+        }
+
+        .button-group {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 20px;
+        }
+
+        button {
+            flex: 1;
+            padding: 12px 24px;
+            border: none;
+            border-radius: 8px;
+            font-size: 14px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s;
+        }
+
+        .btn-test {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+        }
+
+        .btn-test:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(102, 126, 234, 0.4);
+        }
+
+        .btn-clear {
+            background: #f5f5f5;
+            color: #666;
+        }
+
+        .btn-clear:hover {
+            background: #e1e8ed;
+        }
+
+        button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+            transform: none !important;
+        }
+
+        .result {
+            margin-top: 30px;
+            padding: 20px;
+            border-radius: 8px;
+            font-size: 14px;
+            line-height: 1.6;
+        }
+
+        .result.success {
+            background: #d4edda;
+            border: 2px solid #c3e6cb;
+            color: #155724;
+        }
+
+        .result.error {
+            background: #f8d7da;
+            border: 2px solid #f5c6cb;
+            color: #721c24;
+        }
+
+        .result.loading {
+            background: #d1ecf1;
+            border: 2px solid #bee5eb;
+            color: #0c5460;
+        }
+
+        .result h3 {
+            margin-bottom: 10px;
+            font-size: 16px;
+        }
+
+        .result pre {
+            background: rgba(0, 0, 0, 0.05);
+            padding: 12px;
+            border-radius: 6px;
+            overflow-x: auto;
+            font-size: 12px;
+            margin-top: 10px;
+        }
+
+        .metrics {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+            gap: 10px;
+            margin-top: 15px;
+        }
+
+        .metric {
+            background: rgba(0, 0, 0, 0.05);
+            padding: 10px;
+            border-radius: 6px;
+        }
+
+        .metric-label {
+            font-size: 12px;
+            color: #666;
+            margin-bottom: 4px;
+        }
+
+        .metric-value {
+            font-size: 16px;
+            font-weight: 600;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Claude Proxy 测试工具</h1>
+        <p class="subtitle">测试你的 Cloudflare Workers 反向代理是否正常工作</p>
+
+        <form id="testForm">
+            <div class="form-group">
+                <label for="proxyUrl">Worker 地址 *</label>
+                <input
+                    type="url"
+                    id="proxyUrl"
+                    placeholder="https://claude-proxy.你的用户名.workers.dev"
+                    required
+                >
+            </div>
+
+            <div class="form-group">
+                <label for="testPath">测试路径（可选）</label>
+                <input
+                    type="text"
+                    id="testPath"
+                    placeholder="/"
+                    value="/"
+                >
+            </div>
+
+            <div class="button-group">
+                <button type="submit" class="btn-test">开始测试</button>
+                <button type="button" class="btn-clear" onclick="clearResult()">清除结果</button>
+            </div>
+        </form>
+
+        <div id="result"></div>
+    </div>
+
+    <script>
+        const form = document.getElementById('testForm');
+        const resultDiv = document.getElementById('result');
+
+        form.addEventListener('submit', async (e) => {
+            e.preventDefault();
+
+            const proxyUrl = document.getElementById('proxyUrl').value.trim();
+            const testPath = document.getElementById('testPath').value.trim();
+            const fullUrl = proxyUrl + testPath;
+
+            // 显示加载状态
+            resultDiv.className = 'result loading';
+            resultDiv.innerHTML = '<h3>⏳ 正在测试...</h3><p>请求中，请稍候...</p>';
+
+            const startTime = Date.now();
+
+            try {
+                const response = await fetch(fullUrl, {
+                    method: 'GET',
+                    mode: 'cors',
+                });
+
+                const endTime = Date.now();
+                const responseTime = endTime - startTime;
+
+                // 获取响应头
+                const headers = {};
+                response.headers.forEach((value, key) => {
+                    headers[key] = value;
+                });
+
+                // 尝试获取响应体
+                let body;
+                const contentType = response.headers.get('content-type') || '';
+
+                if (contentType.includes('application/json')) {
+                    body = await response.json();
+                } else if (contentType.includes('text/')) {
+                    body = await response.text();
+                } else {
+                    body = '[二进制数据]';
+                }
+
+                // 显示成功结果
+                resultDiv.className = 'result success';
+                resultDiv.innerHTML = `
+                    <h3>✅ 测试成功！</h3>
+                    <p>代理服务正常工作</p>
+
+                    <div class="metrics">
+                        <div class="metric">
+                            <div class="metric-label">状态码</div>
+                            <div class="metric-value">${response.status}</div>
+                        </div>
+                        <div class="metric">
+                            <div class="metric-label">响应时间</div>
+                            <div class="metric-value">${responseTime}ms</div>
+                        </div>
+                        <div class="metric">
+                            <div class="metric-label">缓存状态</div>
+                            <div class="metric-value">${headers['x-cache-status'] || 'N/A'}</div>
+                        </div>
+                        <div class="metric">
+                            <div class="metric-label">代理标识</div>
+                            <div class="metric-value">${headers['x-proxy-by'] || 'N/A'}</div>
+                        </div>
+                    </div>
+
+                    <h4 style="margin-top: 20px; margin-bottom: 10px;">响应头：</h4>
+                    <pre>${JSON.stringify(headers, null, 2)}</pre>
+
+                    <h4 style="margin-top: 20px; margin-bottom: 10px;">响应体（前 500 字符）：</h4>
+                    <pre>${typeof body === 'object' ? JSON.stringify(body, null, 2).substring(0, 500) : String(body).substring(0, 500)}</pre>
+                `;
+
+            } catch (error) {
+                // 显示错误结果
+                resultDiv.className = 'result error';
+                resultDiv.innerHTML = `
+                    <h3>❌ 测试失败</h3>
+                    <p><strong>错误信息：</strong></p>
+                    <pre>${error.message}</pre>
+
+                    <h4 style="margin-top: 20px; margin-bottom: 10px;">可能的原因：</h4>
+                    <ul style="padding-left: 20px;">
+                        <li>Worker 地址输入错误</li>
+                        <li>Worker 未部署或已停用</li>
+                        <li>目标服务器无法访问</li>
+                        <li>网络连接问题</li>
+                        <li>CORS 配置问题</li>
+                    </ul>
+
+                    <h4 style="margin-top: 20px; margin-bottom: 10px;">建议：</h4>
+                    <ul style="padding-left: 20px;">
+                        <li>检查 Worker 地址是否正确</li>
+                        <li>在 Cloudflare Dashboard 确认 Worker 状态</li>
+                        <li>查看 Worker 日志排查问题</li>
+                    </ul>
+                `;
+            }
+        });
+
+        function clearResult() {
+            resultDiv.innerHTML = '';
+            resultDiv.className = '';
+        }
+    </script>
+</body>
+</html>

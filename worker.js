@@ -1,0 +1,789 @@
+/**
+ * Cloudflare Workers 反向代理 - Claude AI 中转站加速
+ * 目标地址: https://anyrouter.top
+ *
+ * 功能特性：
+ * - 🌏 智能路由：国内访问 → Cloudflare国内节点 → Cloudflare海外节点 → anyrouter.top
+ * - 🚀 强制海外出口：绕过 GFW，确保国内用户可访问被墙站点
+ * - 📍 地理位置检测：自动识别中国大陆/港澳台访问者
+ * - 💾 智能缓存（静态资源和 GET 请求）
+ * - 🌊 流式传输支持（SSE for Claude AI）
+ * - 🔄 自动重试机制
+ * - ⚡ 性能优化（Keep-Alive、超时控制）
+ * - 🔐 完整的 CORS 支持
+ * - 📝 错误处理和详细日志记录
+ *
+ * 路由工作原理：
+ * 1. 用户访问 Worker 域名，Cloudflare 自动解析到最近的边缘节点（国内用户 → 国内节点）
+ * 2. Worker 检测用户地理位置（通过 request.cf.country）
+ * 3. 如果来自中国且启用 forceInternationalEgress，则配置 cf 参数强制使用海外出口
+ * 4. 请求通过 Cloudflare 全球骨干网络路由到海外节点，再访问目标站点
+ * 5. 这样即使目标站点在国内被墙，用户也能正常访问
+ */
+
+// 配置项
+const CONFIG = {
+  // 目标中转站地址（多镜像支持，按优先级排序）
+  targetUrls: [
+    'https://anyrouter.top',                                 // 主站点（优先）
+    'https://c.cspok.cn',                                    // 备用镜像 1
+    'https://pmpjfbhq.cn-nb1.rainapp.top',                   // 备用镜像 2
+    'https://a-ocnfniawgw.cn-shanghai.fcapp.run',            // 备用镜像 3
+  ],
+
+  // 允许的请求方法
+  allowedMethods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS', 'HEAD'],
+
+  // 路由配置：强制使用海外节点
+  routing: {
+    // 强制通过 Cloudflare 海外节点访问目标（绕过国内 GFW）
+    forceInternationalEgress: true,
+    // 国内访问者检测（通过 Cloudflare 提供的地理位置信息）
+    chinaRegions: ['CN', 'HK', 'MO', 'TW'],
+  },
+
+  // 镜像切换配置
+  mirror: {
+    // 是否启用自动故障转移
+    autoFailover: true,
+    // 单个镜像的超时时间（毫秒）
+    singleMirrorTimeout: 10000,
+    // 触发切换的 HTTP 状态码
+    failoverStatuses: [502, 503, 504, 521, 522, 523, 524],
+  },
+
+  // 缓存配置
+  cache: {
+    // GET 请求缓存时间（秒）
+    defaultTtl: 300,
+    // 静态资源缓存时间（秒）
+    staticTtl: 86400,
+    // 静态资源文件扩展名
+    staticExtensions: ['.jpg', '.jpeg', '.png', '.gif', '.svg', '.css', '.js', '.woff', '.woff2', '.ttf', '.ico'],
+  },
+
+  // 重试配置
+  retry: {
+    maxRetries: 2,
+    retryDelay: 1000, // 毫秒
+    retryableStatuses: [502, 503, 504],
+  },
+
+  // 请求超时配置（毫秒）
+  timeout: 60000,
+
+  // 调试配置
+  debug: {
+    enabled: true, // 开启详细日志
+    logRequestBody: true, // 记录请求体
+    logResponseBody: true, // 记录响应体（仅非流式响应）
+    logRouting: true, // 记录路由信息
+  },
+};
+
+// 需要移除的请求头
+const HEADERS_TO_REMOVE = [
+  'cf-connecting-ip',
+  'cf-ray',
+  'cf-visitor',
+  'cf-worker',
+  'x-forwarded-proto',
+  'x-real-ip',
+];
+
+export default {
+  async fetch(request, env, ctx) {
+    const startTime = Date.now();
+
+    try {
+      // 获取客户端地理位置信息（Cloudflare 自动提供）
+      const clientCountry = request.cf?.country || 'UNKNOWN';
+      const clientRegion = request.cf?.region || 'UNKNOWN';
+      const clientCity = request.cf?.city || 'UNKNOWN';
+      const isFromChina = CONFIG.routing.chinaRegions.includes(clientCountry);
+
+      // 调试日志：客户端信息
+      if (CONFIG.debug.enabled && CONFIG.debug.logRouting) {
+        console.log('=== 客户端地理位置信息 ===');
+        console.log('国家/地区:', clientCountry);
+        console.log('省份/州:', clientRegion);
+        console.log('城市:', clientCity);
+        console.log('是否来自中国大陆/港澳台:', isFromChina);
+        console.log('路由策略:', CONFIG.routing.forceInternationalEgress ? '强制海外出口' : '自动选择');
+      }
+
+      // 诊断端点：用于测试代理是否正常工作
+      const url = new URL(request.url);
+      if (url.pathname === '/_health' || url.pathname === '/health') {
+        return new Response(JSON.stringify({
+          status: 'ok',
+          message: 'Cloudflare Claude 代理服务运行正常',
+          targetUrls: CONFIG.targetUrls,
+          primaryTarget: CONFIG.targetUrls[0],
+          timestamp: new Date().toISOString(),
+          debug: CONFIG.debug.enabled,
+          routing: {
+            forceInternationalEgress: CONFIG.routing.forceInternationalEgress,
+            clientCountry,
+            clientRegion,
+            clientCity,
+            isFromChina,
+          },
+          mirror: {
+            autoFailover: CONFIG.mirror.autoFailover,
+            totalMirrors: CONFIG.targetUrls.length,
+          },
+          cloudflare: {
+            colo: request.cf?.colo || 'UNKNOWN',  // Cloudflare 数据中心代码
+            asn: request.cf?.asn || 'UNKNOWN',    // 自治系统编号
+            timezone: request.cf?.timezone || 'UNKNOWN',
+          },
+        }), {
+          status: 200,
+          headers: {
+            'Content-Type': 'application/json; charset=utf-8',
+            ...getCORSHeaders(),
+          },
+        });
+      }
+
+      // 连接测试端点：测试所有镜像的可达性
+      if (url.pathname === '/_test' || url.pathname === '/test') {
+        const mirrorTests = [];
+
+        for (let i = 0; i < CONFIG.targetUrls.length; i++) {
+          const targetUrl = CONFIG.targetUrls[i];
+          const isPrimary = i === 0;
+
+          try {
+            const testStart = Date.now();
+            const testResponse = await fetch(targetUrl, {
+              method: 'HEAD',
+              signal: AbortSignal.timeout(CONFIG.mirror.singleMirrorTimeout),
+              cf: {
+                cacheTtl: -1,
+                ...(isFromChina && CONFIG.routing.forceInternationalEgress ? {
+                  mirage: false,
+                  polish: 'off',
+                } : {}),
+              },
+            });
+            const testDuration = Date.now() - testStart;
+
+            mirrorTests.push({
+              url: targetUrl,
+              status: 'success',
+              isPrimary,
+              priority: i + 1,
+              httpStatus: testResponse.status,
+              duration: `${testDuration}ms`,
+              reachable: testResponse.ok,
+            });
+          } catch (error) {
+            mirrorTests.push({
+              url: targetUrl,
+              status: 'failed',
+              isPrimary,
+              priority: i + 1,
+              error: error.message,
+              reachable: false,
+            });
+          }
+        }
+
+        const anyReachable = mirrorTests.some(t => t.reachable);
+        const primaryReachable = mirrorTests[0]?.reachable || false;
+
+        return new Response(JSON.stringify({
+          status: anyReachable ? 'success' : 'failed',
+          message: anyReachable
+            ? (primaryReachable ? '主站点可达' : '主站点不可达，但备用镜像可用')
+            : '所有镜像均不可达',
+          mirrors: mirrorTests,
+          client: {
+            country: clientCountry,
+            region: clientRegion,
+            city: clientCity,
+            isFromChina,
+          },
+          worker: {
+            colo: request.cf?.colo || 'UNKNOWN',
+            coloLocation: getColoLocation(request.cf?.colo),
+          },
+          recommendation: primaryReachable
+            ? '✅ 主站点运行正常'
+            : (anyReachable ? '⚠️ 建议使用备用镜像或检查网络' : '❌ 所有站点均不可达，请检查 Worker 节点位置'),
+          timestamp: new Date().toISOString(),
+        }), {
+          status: anyReachable ? 200 : 500,
+          headers: {
+            'Content-Type': 'application/json; charset=utf-8',
+            ...getCORSHeaders(),
+          },
+        });
+      }
+
+      // 处理 CORS 预检请求
+      if (request.method === 'OPTIONS') {
+        return handleCORS(request);
+      }
+
+      // 检查请求方法
+      if (!CONFIG.allowedMethods.includes(request.method)) {
+        return new Response('Method Not Allowed', {
+          status: 405,
+          headers: getCORSHeaders(),
+        });
+      }
+
+      // 尝试从缓存获取（仅 GET 和 HEAD 请求）
+      if (request.method === 'GET' || request.method === 'HEAD') {
+        const cache = caches.default;
+        const cachedResponse = await cache.match(request);
+
+        if (cachedResponse) {
+          const response = new Response(cachedResponse.body, cachedResponse);
+          response.headers.set('X-Cache-Status', 'HIT');
+          response.headers.set('X-Response-Time', `${Date.now() - startTime}ms`);
+          if (CONFIG.debug.enabled) {
+            console.log('缓存命中:', request.url);
+          }
+          return response;
+        }
+      }
+
+      // 执行代理请求（带多镜像故障转移）
+      const response = await proxyRequestWithMirrorFailover(request, isFromChina);
+
+      // 添加性能和缓存标识头
+      response.headers.set('X-Cache-Status', 'MISS');
+      response.headers.set('X-Response-Time', `${Date.now() - startTime}ms`);
+      response.headers.set('X-Proxy-By', 'Cloudflare-Workers');
+      response.headers.set('X-Client-Country', clientCountry);
+      response.headers.set('X-Routing-Via', isFromChina && CONFIG.routing.forceInternationalEgress ? 'International-Egress' : 'Auto');
+
+      // 对可缓存的响应进行缓存
+      if (shouldCache(request, response)) {
+        const cacheResponse = response.clone();
+        ctx.waitUntil(cacheWithTTL(request, cacheResponse));
+      }
+
+      return response;
+
+    } catch (error) {
+      console.error('=== 代理错误 ===');
+      console.error('错误类型:', error.name);
+      console.error('错误消息:', error.message);
+      console.error('错误堆栈:', error.stack);
+      console.error('请求 URL:', request.url);
+      console.error('请求方法:', request.method);
+
+      // 构建详细的错误响应
+      const errorResponse = {
+        error: '代理请求失败',
+        message: error.message || '内部服务器错误',
+        details: {
+          errorType: error.name,
+          targetUrls: CONFIG.targetUrls,
+          primaryTarget: CONFIG.targetUrls[0],
+          requestUrl: request.url,
+          requestMethod: request.method,
+        },
+        timestamp: new Date().toISOString(),
+        responseTime: `${Date.now() - startTime}ms`,
+      };
+
+      // 如果是超时错误，提供更明确的信息
+      if (error.name === 'AbortError') {
+        errorResponse.message = '请求超时：目标服务器响应时间过长';
+        errorResponse.details.timeout = `${CONFIG.timeout}ms`;
+      }
+
+      return new Response(
+        JSON.stringify(errorResponse, null, 2),
+        {
+          status: 500,
+          headers: {
+            'Content-Type': 'application/json; charset=utf-8',
+            ...getCORSHeaders(),
+          },
+        }
+      );
+    }
+  },
+};
+
+/**
+ * 多镜像故障转移代理请求
+ * @param {Request} request - 原始请求
+ * @param {boolean} isFromChina - 是否来自中国大陆/港澳台
+ */
+async function proxyRequestWithMirrorFailover(request, isFromChina = false) {
+  const errors = [];
+
+  // 遍历所有镜像地址
+  for (let mirrorIndex = 0; mirrorIndex < CONFIG.targetUrls.length; mirrorIndex++) {
+    const currentTargetUrl = CONFIG.targetUrls[mirrorIndex];
+    const isPrimary = mirrorIndex === 0;
+
+    try {
+      if (CONFIG.debug.enabled) {
+        console.log(`=== 尝试镜像 ${mirrorIndex + 1}/${CONFIG.targetUrls.length} ===`);
+        console.log('镜像地址:', currentTargetUrl);
+        console.log('优先级:', isPrimary ? '主站点' : `备用镜像 ${mirrorIndex}`);
+      }
+
+      // 使用当前镜像发起请求（带重试）
+      const response = await proxyRequestWithRetry(request, isFromChina, currentTargetUrl, 0);
+
+      // 检查响应状态是否需要故障转移
+      if (CONFIG.mirror.autoFailover && CONFIG.mirror.failoverStatuses.includes(response.status)) {
+        const errorMsg = `镜像 ${mirrorIndex + 1} 返回错误状态 ${response.status}`;
+        console.warn(errorMsg);
+        errors.push({ mirror: currentTargetUrl, error: errorMsg, status: response.status });
+
+        // 如果不是最后一个镜像，继续尝试下一个
+        if (mirrorIndex < CONFIG.targetUrls.length - 1) {
+          console.log('切换到下一个镜像...');
+          continue;
+        }
+      }
+
+      // 成功响应，添加使用的镜像信息
+      const modifiedResponse = new Response(response.body, response);
+      modifiedResponse.headers.set('X-Mirror-Used', currentTargetUrl);
+      modifiedResponse.headers.set('X-Mirror-Index', String(mirrorIndex + 1));
+      modifiedResponse.headers.set('X-Mirror-Priority', isPrimary ? 'primary' : 'backup');
+
+      if (CONFIG.debug.enabled) {
+        console.log(`✓ 镜像 ${mirrorIndex + 1} 响应成功`);
+      }
+
+      return modifiedResponse;
+
+    } catch (error) {
+      const errorMsg = `镜像 ${mirrorIndex + 1} 请求失败: ${error.message}`;
+      console.error(errorMsg);
+      errors.push({ mirror: currentTargetUrl, error: errorMsg, type: error.name });
+
+      // 如果是最后一个镜像，抛出错误
+      if (mirrorIndex === CONFIG.targetUrls.length - 1) {
+        console.error('=== 所有镜像均失败 ===');
+        errors.forEach((e, i) => {
+          console.error(`镜像 ${i + 1}:`, e.mirror, '-', e.error);
+        });
+
+        // 返回详细的错误信息
+        const detailedError = new Error(`所有镜像均不可达。尝试了 ${CONFIG.targetUrls.length} 个镜像`);
+        detailedError.mirrorErrors = errors;
+        throw detailedError;
+      }
+
+      // 继续尝试下一个镜像
+      console.log(`切换到镜像 ${mirrorIndex + 2}...`);
+    }
+  }
+
+  // 理论上不应该到这里
+  throw new Error('镜像故障转移逻辑异常');
+}
+
+/**
+ * 带重试机制的代理请求
+ * @param {Request} request - 原始请求
+ * @param {boolean} isFromChina - 是否来自中国大陆/港澳台
+ * @param {string} targetUrlString - 目标镜像地址
+ * @param {number} retryCount - 重试次数
+ */
+async function proxyRequestWithRetry(request, isFromChina = false, targetUrlString, retryCount = 0) {
+  try {
+    // 构建目标 URL
+    const url = new URL(request.url);
+    const targetUrl = new URL(targetUrlString);
+    targetUrl.pathname = url.pathname;
+    targetUrl.search = url.search;
+
+    // 调试日志：记录请求信息
+    if (CONFIG.debug.enabled) {
+      console.log('=== 代理请求开始 ===');
+      console.log('请求方法:', request.method);
+      console.log('原始 URL:', request.url);
+      console.log('目标 URL:', targetUrl.toString());
+      console.log('重试次数:', retryCount);
+      console.log('来自中国:', isFromChina);
+    }
+
+    // 构建请求头
+    const headers = buildProxyHeaders(request, targetUrlString);
+
+    // 调试日志：记录请求头
+    if (CONFIG.debug.enabled) {
+      console.log('请求头:', Object.fromEntries(headers.entries()));
+    }
+
+    // 构建请求配置
+    const proxyInit = {
+      method: request.method,
+      headers: headers,
+      // 启用 Cloudflare 加速特性和路由优化
+      cf: {
+        // 禁用 Cloudflare 自动缓存，使用自定义缓存逻辑
+        cacheTtl: -1,
+        cacheEverything: false,
+        cacheLevel: 'basic',
+
+        // 关键配置：强制使用海外节点（绕过 GFW）
+        // 当用户来自中国且启用了强制海外出口时，确保请求通过海外节点
+        ...(isFromChina && CONFIG.routing.forceInternationalEgress ? {
+          // 禁用中国大陆优化，强制使用国际路由
+          mirage: false,
+          polish: 'off',
+          // 使用 Cloudflare 的全球骨干网络
+          minify: {
+            javascript: false,
+            css: false,
+            html: false,
+          },
+        } : {}),
+      },
+    };
+
+    // 处理请求体（POST/PUT/PATCH）
+    if (['POST', 'PUT', 'PATCH'].includes(request.method)) {
+      const contentType = request.headers.get('content-type') || '';
+
+      // 调试日志：记录 Content-Type
+      if (CONFIG.debug.enabled) {
+        console.log('Content-Type:', contentType);
+      }
+
+      // 检查是否是流式请求（SSE）
+      if (contentType.includes('text/event-stream') || contentType.includes('application/stream')) {
+        // 流式请求直接传递 body
+        proxyInit.body = request.body;
+        if (CONFIG.debug.enabled) {
+          console.log('检测到流式请求，直接传递 body');
+        }
+      } else {
+        // 非流式请求：读取并记录请求体
+        try {
+          const clonedRequest = request.clone();
+          const bodyText = await clonedRequest.text();
+
+          // 调试日志：记录请求体
+          if (CONFIG.debug.enabled && CONFIG.debug.logRequestBody) {
+            console.log('请求体长度:', bodyText.length);
+            console.log('请求体内容:', bodyText.substring(0, 1000)); // 只显示前1000字符
+          }
+
+          // 重新赋值请求体
+          proxyInit.body = bodyText;
+        } catch (bodyError) {
+          console.error('读取请求体失败:', bodyError);
+          // 降级方案：使用 arrayBuffer
+          proxyInit.body = await request.clone().arrayBuffer();
+        }
+      }
+    }
+
+    // 发送请求
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), CONFIG.timeout);
+
+    if (CONFIG.debug.enabled) {
+      console.log('发送请求到目标服务器...');
+    }
+
+    const response = await fetch(targetUrl.toString(), {
+      ...proxyInit,
+      signal: controller.signal,
+    });
+
+    clearTimeout(timeoutId);
+
+    // 调试日志：记录响应信息
+    if (CONFIG.debug.enabled) {
+      console.log('=== 收到响应 ===');
+      console.log('响应状态:', response.status, response.statusText);
+      console.log('响应头:', Object.fromEntries(response.headers.entries()));
+    }
+
+    // 检查是否需要重试
+    if (
+      CONFIG.retry.retryableStatuses.includes(response.status) &&
+      retryCount < CONFIG.retry.maxRetries
+    ) {
+      console.log(`服务器返回 ${response.status}，重试中 (${retryCount + 1}/${CONFIG.retry.maxRetries})...`);
+      await sleep(CONFIG.retry.retryDelay);
+      return proxyRequestWithRetry(request, isFromChina, targetUrlString, retryCount + 1);
+    }
+
+    // 调试日志：路由成功
+    if (CONFIG.debug.enabled && CONFIG.debug.logRouting) {
+      console.log('=== 路由成功 ===');
+      console.log('使用海外节点:', isFromChina && CONFIG.routing.forceInternationalEgress);
+      console.log('响应状态:', response.status);
+    }
+
+    // 构建响应
+    return buildProxyResponse(response);
+
+  } catch (error) {
+    console.error('代理请求异常:', error.message);
+    console.error('错误堆栈:', error.stack);
+
+    // 重试逻辑
+    if (retryCount < CONFIG.retry.maxRetries) {
+      console.log(`请求失败，重试中 (${retryCount + 1}/${CONFIG.retry.maxRetries})...`);
+      await sleep(CONFIG.retry.retryDelay);
+      return proxyRequestWithRetry(request, isFromChina, targetUrlString, retryCount + 1);
+    }
+
+    throw error;
+  }
+}
+
+/**
+ * 构建代理请求头
+ * @param {Request} request - 原始请求
+ * @param {string} targetUrlString - 目标镜像地址
+ */
+function buildProxyHeaders(request, targetUrlString) {
+  const headers = new Headers(request.headers);
+
+  // 移除 Cloudflare 特定头
+  HEADERS_TO_REMOVE.forEach(header => headers.delete(header));
+
+  // 设置目标主机
+  const targetUrl = new URL(targetUrlString);
+  headers.set('Host', targetUrl.host);
+
+  // 保留客户端真实 IP
+  const clientIP = request.headers.get('cf-connecting-ip');
+  if (clientIP) {
+    const existingXFF = headers.get('X-Forwarded-For');
+    headers.set('X-Forwarded-For', existingXFF ? `${existingXFF}, ${clientIP}` : clientIP);
+    headers.set('X-Real-IP', clientIP);
+  }
+
+  // 设置连接优化头
+  headers.set('Connection', 'keep-alive');
+
+  // 确保接受编码
+  if (!headers.has('Accept-Encoding')) {
+    headers.set('Accept-Encoding', 'gzip, deflate, br');
+  }
+
+  return headers;
+}
+
+/**
+ * 构建代理响应
+ */
+async function buildProxyResponse(response) {
+  // 检查是否是流式响应（SSE）
+  const contentType = response.headers.get('content-type') || '';
+  const isStream = contentType.includes('text/event-stream') ||
+                   contentType.includes('application/stream+json');
+
+  // 调试日志：记录响应类型
+  if (CONFIG.debug.enabled) {
+    console.log('响应类型:', isStream ? '流式响应' : '普通响应');
+    console.log('Content-Type:', contentType);
+  }
+
+  // 对于非流式响应，记录响应体（用于调试）
+  let responseBody = response.body;
+  if (CONFIG.debug.enabled && CONFIG.debug.logResponseBody && !isStream) {
+    try {
+      const clonedResponse = response.clone();
+      const bodyText = await clonedResponse.text();
+      console.log('响应体长度:', bodyText.length);
+      console.log('响应体内容:', bodyText.substring(0, 1000)); // 只显示前1000字符
+
+      // 尝试解析 JSON 验证格式
+      try {
+        const jsonBody = JSON.parse(bodyText);
+        console.log('响应体 JSON 解析成功');
+        console.log('JSON 键:', Object.keys(jsonBody));
+      } catch (jsonError) {
+        console.log('响应体不是有效的 JSON 格式');
+      }
+    } catch (logError) {
+      console.error('记录响应体时出错:', logError.message);
+    }
+  }
+
+  // 创建新响应
+  const modifiedResponse = new Response(responseBody, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: response.headers,
+  });
+
+  // 添加 CORS 头
+  const corsHeaders = getCORSHeaders();
+  Object.entries(corsHeaders).forEach(([key, value]) => {
+    modifiedResponse.headers.set(key, value);
+  });
+
+  // 移除可能导致问题的安全头
+  modifiedResponse.headers.delete('Content-Security-Policy');
+  modifiedResponse.headers.delete('X-Frame-Options');
+
+  // 对于流式响应，确保不被缓存
+  if (isStream) {
+    modifiedResponse.headers.set('Cache-Control', 'no-cache, no-store, must-revalidate');
+    modifiedResponse.headers.set('X-Accel-Buffering', 'no');
+  }
+
+  if (CONFIG.debug.enabled) {
+    console.log('=== 代理响应构建完成 ===');
+  }
+
+  return modifiedResponse;
+}
+
+/**
+ * 判断是否应该缓存
+ */
+function shouldCache(request, response) {
+  // 只缓存 GET 请求
+  if (request.method !== 'GET') {
+    return false;
+  }
+
+  // 只缓存成功的响应
+  if (response.status !== 200) {
+    return false;
+  }
+
+  // 检查响应头中的缓存控制
+  const cacheControl = response.headers.get('Cache-Control');
+  if (cacheControl && (cacheControl.includes('no-store') || cacheControl.includes('private'))) {
+    return false;
+  }
+
+  // 不缓存流式响应
+  const contentType = response.headers.get('content-type') || '';
+  if (contentType.includes('text/event-stream') || contentType.includes('application/stream')) {
+    return false;
+  }
+
+  return true;
+}
+
+/**
+ * 缓存响应并设置 TTL
+ */
+async function cacheWithTTL(request, response) {
+  try {
+    const url = new URL(request.url);
+    const isStatic = CONFIG.cache.staticExtensions.some(ext => url.pathname.endsWith(ext));
+    const ttl = isStatic ? CONFIG.cache.staticTtl : CONFIG.cache.defaultTtl;
+
+    // 设置缓存控制头
+    response.headers.set('Cache-Control', `public, max-age=${ttl}`);
+
+    const cache = caches.default;
+    await cache.put(request, response);
+  } catch (error) {
+    console.error('Cache error:', error);
+  }
+}
+
+/**
+ * 获取 CORS 响应头
+ */
+function getCORSHeaders() {
+  return {
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Methods': CONFIG.allowedMethods.join(', '),
+    'Access-Control-Allow-Headers': '*',
+    'Access-Control-Max-Age': '86400',
+    'Access-Control-Expose-Headers': '*',
+  };
+}
+
+/**
+ * 处理 CORS 预检请求
+ */
+function handleCORS(request) {
+  const headers = {
+    ...getCORSHeaders(),
+    'Access-Control-Allow-Headers': request.headers.get('Access-Control-Request-Headers') || '*',
+  };
+
+  return new Response(null, {
+    status: 204,
+    headers: headers,
+  });
+}
+
+/**
+ * 延迟函数
+ */
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+/**
+ * 获取 Cloudflare 数据中心位置信息
+ * @param {string} colo - Cloudflare 数据中心代码（如 HKG, SIN, LAX）
+ * @returns {object} 位置信息
+ */
+function getColoLocation(colo) {
+  if (!colo || colo === 'UNKNOWN') {
+    return { region: 'UNKNOWN', inChina: false };
+  }
+
+  // 中国大陆及港澳台的数据中心代码
+  const chinaColo = ['HKG', 'TPE', 'SJW', 'TSN', 'SZX', 'FOC', 'CAN', 'CGO', 'CTU', 'DLC', 'HGH', 'KHN', 'NKG', 'SHA', 'TAO', 'WUH', 'XIY'];
+
+  const coloMap = {
+    // 中国大陆
+    'SJW': { city: '石家庄', country: 'CN', inChina: true },
+    'TSN': { city: '天津', country: 'CN', inChina: true },
+    'SZX': { city: '深圳', country: 'CN', inChina: true },
+    'FOC': { city: '福州', country: 'CN', inChina: true },
+    'CAN': { city: '广州', country: 'CN', inChina: true },
+    'CGO': { city: '郑州', country: 'CN', inChina: true },
+    'CTU': { city: '成都', country: 'CN', inChina: true },
+    'DLC': { city: '大连', country: 'CN', inChina: true },
+    'HGH': { city: '杭州', country: 'CN', inChina: true },
+    'KHN': { city: '南昌', country: 'CN', inChina: true },
+    'NKG': { city: '南京', country: 'CN', inChina: true },
+    'SHA': { city: '上海', country: 'CN', inChina: true },
+    'TAO': { city: '青岛', country: 'CN', inChina: true },
+    'WUH': { city: '武汉', country: 'CN', inChina: true },
+    'XIY': { city: '西安', country: 'CN', inChina: true },
+
+    // 港澳台
+    'HKG': { city: '香港', country: 'HK', inChina: false },
+    'TPE': { city: '台北', country: 'TW', inChina: false },
+
+    // 亚太其他
+    'SIN': { city: '新加坡', country: 'SG', inChina: false },
+    'NRT': { city: '东京', country: 'JP', inChina: false },
+    'ICN': { city: '首尔', country: 'KR', inChina: false },
+
+    // 美洲
+    'LAX': { city: '洛杉矶', country: 'US', inChina: false },
+    'SJC': { city: '圣何塞', country: 'US', inChina: false },
+    'SEA': { city: '西雅图', country: 'US', inChina: false },
+
+    // 欧洲
+    'LHR': { city: '伦敦', country: 'GB', inChina: false },
+    'FRA': { city: '法兰克福', country: 'DE', inChina: false },
+  };
+
+  const info = coloMap[colo] || { city: colo, country: 'UNKNOWN', inChina: chinaColo.includes(colo) };
+
+  return {
+    code: colo,
+    city: info.city,
+    country: info.country,
+    inChina: info.inChina,
+    region: info.inChina ? '中国大陆' : (info.country === 'HK' ? '香港' : (info.country === 'TW' ? '台湾' : '海外')),
+  };
+}
