@@ -15,7 +15,65 @@
 
 ## 部署步骤
 
-### 方法一：使用 Wrangler CLI（推荐）
+### 方法一：GitHub 自动部署（推荐）⭐
+
+将项目推送到 GitHub，每次代码更新时自动部署到 Cloudflare。
+
+#### 1. 获取 Cloudflare API Token 和 Account ID
+
+**获取 API Token：**
+1. 登录 [Cloudflare Dashboard](https://dash.cloudflare.com/)
+2. 点击右上角头像 → **My Profile** → **API Tokens**
+3. 点击 **Create Token**
+4. 选择 **Edit Cloudflare Workers** 模板
+5. 点击 **Continue to summary** → **Create Token**
+6. **复制并保存** Token（只显示一次）
+
+**获取 Account ID：**
+1. 在 Cloudflare Dashboard 点击左侧 **Workers & Pages**
+2. 右侧会显示你的 **Account ID**，复制它
+
+#### 2. 配置 GitHub Secrets
+
+1. 在 GitHub 仓库页面，点击 **Settings** → **Secrets and variables** → **Actions**
+2. 点击 **New repository secret**，添加两个密钥：
+   - **Name**: `CLOUDFLARE_API_TOKEN`
+     **Value**: 粘贴你的 API Token
+   - **Name**: `CLOUDFLARE_ACCOUNT_ID`
+     **Value**: 粘贴你的 Account ID
+
+#### 3. 推送代码到 GitHub
+
+```bash
+# 初始化 Git 仓库（如果还没有）
+git init
+
+# 添加远程仓库
+git remote add origin https://github.com/你的用户名/cloudflare-claude-proxy.git
+
+# 添加文件
+git add .
+
+# 提交
+git commit -m "feat: 初始化 Cloudflare Workers 代理项目"
+
+# 推送到 GitHub
+git push -u origin master
+```
+
+#### 4. 自动部署
+
+推送成功后，GitHub Actions 会自动触发部署：
+
+1. 在 GitHub 仓库页面，点击 **Actions** 标签
+2. 查看部署进度
+3. 部署成功后，会显示 Worker 访问地址
+
+以后每次推送代码到 `master` 分支，都会自动部署到 Cloudflare！
+
+---
+
+### 方法二：使用 Wrangler CLI
 
 #### 1. 安装 Wrangler CLI
 
@@ -58,7 +116,7 @@ wrangler deploy
 
 ---
 
-### 方法二：使用 Cloudflare Dashboard
+### 方法三：使用 Cloudflare Dashboard
 
 #### 1. 登录 Cloudflare Dashboard
 

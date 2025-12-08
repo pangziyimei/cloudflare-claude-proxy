@@ -1,0 +1,29 @@
+# GitHub Actions 自动部署到 Cloudflare Workers
+# 每次推送到 master 分支时自动部署
+
+name: 部署到 Cloudflare Workers
+
+on:
+  # 推送到 master 分支时触发
+  push:
+    branches:
+      - master
+      - main
+
+  # 允许手动触发部署
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    name: 部署 Worker
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 部署到 Cloudflare Workers
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
