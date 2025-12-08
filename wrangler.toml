@@ -32,6 +32,5 @@ cpu_ms = 50
 # binding = "RATE_LIMIT"
 # id = "你的KV命名空间ID"
 
-# 兼容性标志
-[compatibility_flags]
-nodejs_compat = false
+# 兼容性标志（数组格式，如需启用 Node.js 兼容则添加 "nodejs_compat"）
+compatibility_flags = []
