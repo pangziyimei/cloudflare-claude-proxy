@@ -889,7 +889,7 @@ async function proxyRequestWithRetry(request, isFromChina = false, targetUrlStri
     }
 
     // 构建响应
-    return buildProxyResponse(response);
+    return buildProxyResponse(response, request, targetUrlString);
 
   } catch (error) {
     log('ERROR', '代理请求异常:', error.message);
@@ -942,8 +942,17 @@ function buildProxyHeaders(request, targetUrlString) {
 
 /**
  * 构建代理响应
+ * @param {Response} response - 原始响应
+ * @param {Request} originalRequest - 原始请求（用于获取代理域名）
+ * @param {string} targetUrlString - 目标镜像地址
  */
-async function buildProxyResponse(response) {
+async function buildProxyResponse(response, originalRequest, targetUrlString) {
+  // 获取代理域名和源站域名
+  const proxyUrl = new URL(originalRequest.url);
+  const targetUrl = new URL(targetUrlString);
+  const proxyOrigin = proxyUrl.origin;  // 代理站的 origin (https://your-worker.workers.dev)
+  const targetOrigin = targetUrl.origin; // 源站的 origin (https://anyrouter.top)
+
   // 检查是否是流式响应（SSE）
   const contentType = response.headers.get('content-type') || '';
   const isStream = contentType.includes('text/event-stream') ||
@@ -977,11 +986,66 @@ async function buildProxyResponse(response) {
     }
   }
 
+  // 检查是否是 HTML 响应，需要重写内容中的 URL
+  const isHtml = contentType.includes('text/html');
+  const isJs = contentType.includes('javascript') || contentType.includes('application/json');
+
+  // 如果是 HTML 或 JS 响应，重写响应体中的源站 URL
+  if ((isHtml || isJs) && !isStream) {
+    try {
+      const originalBody = await response.text();
+      // 替换所有源站 URL 为代理站 URL
+      let modifiedBody = originalBody
+        .split(targetOrigin).join(proxyOrigin)
+        .split(targetUrl.host).join(proxyUrl.host);
+
+      responseBody = modifiedBody;
+      log('DEBUG', `${isHtml ? 'HTML' : 'JS/JSON'} 响应体 URL 重写完成: ${targetOrigin} -> ${proxyOrigin}`);
+    } catch (rewriteError) {
+      log('ERROR', '响应体重写失败:', rewriteError.message);
+      // 如果重写失败，使用原始响应体
+      responseBody = response.body;
+    }
+  }
+
+  // 创建新的 Headers 对象用于修改
+  const newHeaders = new Headers(response.headers);
+
+  // 重写 Location header（处理重定向）
+  const locationHeader = newHeaders.get('Location');
+  if (locationHeader) {
+    let newLocation = locationHeader;
+    // 如果 Location 包含源站地址，替换为代理站地址
+    if (locationHeader.includes(targetOrigin)) {
+      newLocation = locationHeader.replace(targetOrigin, proxyOrigin);
+    } else if (locationHeader.includes(targetUrl.host)) {
+      newLocation = locationHeader.replace(targetUrl.host, proxyUrl.host);
+    } else if (locationHeader.startsWith('/')) {
+      // 相对路径不需要修改
+      newLocation = locationHeader;
+    }
+    newHeaders.set('Location', newLocation);
+    log('DEBUG', `Location header 重写: ${locationHeader} -> ${newLocation}`);
+  }
+
+  // 重写 Set-Cookie header 中的 domain
+  const setCookieHeaders = response.headers.getAll ? response.headers.getAll('Set-Cookie') : [];
+  // Cloudflare Workers 不支持 getAll，需要用另一种方式
+  const setCookieHeader = newHeaders.get('Set-Cookie');
+  if (setCookieHeader) {
+    // 移除或替换 cookie 中的 domain 属性
+    let newSetCookie = setCookieHeader
+      .replace(new RegExp(`domain=${targetUrl.host.replace('.', '\\.')}`, 'gi'), `domain=${proxyUrl.host}`)
+      .replace(new RegExp(`domain=\\.${targetUrl.host.replace('.', '\\.')}`, 'gi'), `domain=.${proxyUrl.host}`);
+    newHeaders.set('Set-Cookie', newSetCookie);
+    log('DEBUG', `Set-Cookie domain 重写完成`);
+  }
+
   // 创建新响应
   const modifiedResponse = new Response(responseBody, {
     status: response.status,
     statusText: response.statusText,
-    headers: response.headers,
+    headers: newHeaders,
   });
 
   // 添加 CORS 头
