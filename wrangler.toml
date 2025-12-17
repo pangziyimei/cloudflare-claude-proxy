@@ -13,9 +13,9 @@ main = "worker.js"
 # account_id = "你的账号ID"
 
 # 使用率限制配置（可选）
-[limits]
+#[limits]
 # CPU 时间限制（毫秒）
-cpu_ms = 50
+#cpu_ms = 50
 
 # 路由配置（部署后绑定域名）
 # [[routes]]
